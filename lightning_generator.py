@@ -9,7 +9,7 @@ bl_info = {
 
 import bpy
 import bmesh
-from mathutils import Vector
+from mathutils import Vector, kdtree
 from bpy.props import (
     FloatProperty, IntProperty, BoolProperty,
     StringProperty, PointerProperty
@@ -83,7 +83,7 @@ def generate_chains(
     Recursively generate lightning chains.
     Returns list of (points_list, t_values_list).
     Index 0 is always the main bolt of this level.
-    t_start / t_end define the time range this bolt occupies (0.05–1.0 for root).
+    t_start / t_end define the time range this bolt occupies (0.0–1.0 for root).
     """
     start = Vector(start)
     end = Vector(end)
@@ -155,35 +155,91 @@ def generate_chains(
 
 # ─── Mesh Builder ───────────────────────────────────────────────────────────────
 
-def build_mesh(chains, name, bolt_length, add_skin, skin_radius_pct):
+def build_mesh(chains, name, bolt_length, bolt_start, bolt_end, add_skin, skin_radius_pct):
     """
     Build a Blender mesh from chains.
-    Each chain is a polyline. Vertex color attribute 'LightningTime'
-    stores t_value as greyscale (R=G=B=t, A=1).
+    Each chain is a polyline. Junction vertices are welded so forks are
+    topologically connected to their parent bolt.
+    Vertex color attribute 'LightningTime' stores t_value as greyscale.
     """
     all_verts = []
     all_edges = []
     all_t = []
+    edge_set = set()
+    vert_map = {}
+
+    axis = (Vector(bolt_end) - Vector(bolt_start))
+    axis_len_sq = max(axis.length_squared, 1e-12)
+
+    def linear_t_from_point(p):
+        rel = Vector(p) - Vector(bolt_start)
+        t = rel.dot(axis) / axis_len_sq
+        return max(0.0, min(1.0, float(t)))
+
+    def get_or_add_vert_idx(p):
+        key = (p.x, p.y, p.z)
+        idx = vert_map.get(key)
+        if idx is None:
+            idx = len(all_verts)
+            vert_map[key] = idx
+            all_verts.append((p.x, p.y, p.z))
+            all_t.append(linear_t_from_point(p))
+        return idx
+
+    def add_edge(i0, i1):
+        if i0 == i1:
+            return
+        e = (i0, i1) if i0 < i1 else (i1, i0)
+        if e in edge_set:
+            return
+        edge_set.add(e)
+        all_edges.append((i0, i1))
+
+    def write_time_attribute(mesh_data, time_values):
+        existing = mesh_data.color_attributes.get("LightningTime")
+        if existing:
+            mesh_data.color_attributes.remove(existing)
+
+        color_attr = mesh_data.color_attributes.new(
+            name="LightningTime",
+            type='FLOAT_COLOR',
+            domain='POINT'
+        )
+
+        count = min(len(color_attr.data), len(time_values))
+        for i in range(count):
+            t = max(0.0, min(1.0, float(time_values[i])))
+            color_attr.data[i].color = (t, t, t, 1.0)
+
+    def bake_time_to_final_mesh(mesh_data, source_verts, source_t):
+        if not source_verts or not mesh_data.vertices:
+            return
+
+        kd = kdtree.KDTree(len(source_verts))
+        for i, co in enumerate(source_verts):
+            kd.insert(Vector(co), i)
+        kd.balance()
+
+        final_t = []
+        for v in mesh_data.vertices:
+            _, idx, _ = kd.find(v.co)
+            final_t.append(source_t[idx])
+
+        write_time_attribute(mesh_data, final_t)
 
     for pts, ts in chains:
-        offset = len(all_verts)
-        all_verts.extend([tuple(p) for p in pts])
-        all_t.extend(ts)
-        for i in range(len(pts) - 1):
-            all_edges.append((offset + i, offset + i + 1))
+        if not pts:
+            continue
+
+        prev_idx = get_or_add_vert_idx(pts[0])
+        for i in range(1, len(pts)):
+            cur_idx = get_or_add_vert_idx(pts[i])
+            add_edge(prev_idx, cur_idx)
+            prev_idx = cur_idx
 
     mesh = bpy.data.meshes.new(name)
     mesh.from_pydata(all_verts, all_edges, [])
     mesh.update()
-
-    # --- Vertex color time mask (Blender 4.x color_attributes API) ---
-    color_attr = mesh.color_attributes.new(
-        name="LightningTime",
-        type='FLOAT_COLOR',
-        domain='POINT'
-    )
-    for i, t in enumerate(all_t):
-        color_attr.data[i].color = (t, t, t, 1.0)
 
     obj = bpy.data.objects.new(name, mesh)
     bpy.context.collection.objects.link(obj)
@@ -199,6 +255,7 @@ def build_mesh(chains, name, bolt_length, add_skin, skin_radius_pct):
             v[skin_layer].radius = (base_r, base_r)
         # Mark root at very first vertex (main bolt start)
         if bm.verts:
+            bm.verts.ensure_lookup_table()
             bm.verts[0][skin_layer].use_root = True
         bm.to_mesh(mesh)
         bm.free()
@@ -210,14 +267,36 @@ def build_mesh(chains, name, bolt_length, add_skin, skin_radius_pct):
         sub_mod.levels = 1
         sub_mod.render_levels = 2
 
+        # Apply generated geometry so color data can be written on final verts.
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        obj_eval = obj.evaluated_get(depsgraph)
+        baked_mesh = bpy.data.meshes.new_from_object(
+            obj_eval,
+            preserve_all_data_layers=False,
+            depsgraph=depsgraph
+        )
+        old_mesh = obj.data
+        obj.modifiers.clear()
+        obj.data = baked_mesh
+        if old_mesh.users == 0:
+            bpy.data.meshes.remove(old_mesh)
+
+        bake_time_to_final_mesh(obj.data, all_verts, all_t)
+    else:
+        write_time_attribute(mesh, all_t)
+
     return obj
 
 
 # ─── Operators ──────────────────────────────────────────────────────────────────
 
 def run_generation(context, props):
-    start_obj = context.scene.objects.get(props.start_obj)
-    end_obj = context.scene.objects.get(props.end_obj)
+    asset_obj = context.object
+    if not asset_obj:
+        return None, "Select a Lightning Asset object"
+
+    start_obj = props.start_obj
+    end_obj = props.end_obj
 
     if not start_obj or not end_obj:
         return None, "Set both Start and End objects in the panel"
@@ -242,17 +321,26 @@ def run_generation(context, props):
         fork_disp=props.fork_disp_scale,
         current_depth=0,
         max_depth=props.max_fork_depth,
-        t_start=0.05,
+        t_start=0.0,
         t_end=1.0,
         rng=rng
     )
 
+    # Replace only this asset's previous output object.
+    prev_obj = bpy.data.objects.get(props.generated_obj_name)
+    if prev_obj:
+        bpy.data.objects.remove(prev_obj, do_unlink=True)
+
+    output_name = f"{asset_obj.name}_Lightning"
+
     obj = build_mesh(
-        chains, "Lightning",
+        chains, output_name,
         bolt_length,
+        start, end,
         add_skin=props.add_skin_modifier,
         skin_radius_pct=props.skin_radius_pct
     )
+    props.generated_obj_name = obj.name
 
     total_verts = sum(len(c[0]) for c in chains)
     msg = f"Generated {len(chains)} chains ({total_verts} verts)"
@@ -266,7 +354,12 @@ class LIGHTNING_OT_generate(Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        props = context.scene.lightning_props
+        asset_obj = context.object
+        if not asset_obj:
+            self.report({'ERROR'}, "Select a Lightning Asset object")
+            return {'CANCELLED'}
+
+        props = asset_obj.lightning_props
         obj, msg = run_generation(context, props)
 
         if obj is None:
@@ -274,8 +367,9 @@ class LIGHTNING_OT_generate(Operator):
             return {'CANCELLED'}
 
         bpy.ops.object.select_all(action='DESELECT')
+        asset_obj.select_set(True)
         obj.select_set(True)
-        context.view_layer.objects.active = obj
+        context.view_layer.objects.active = asset_obj
         self.report({'INFO'}, msg)
         return {'FINISHED'}
 
@@ -288,13 +382,13 @@ class LIGHTNING_OT_regenerate(Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        props = context.scene.lightning_props
-        props.seed += 1
+        asset_obj = context.object
+        if not asset_obj:
+            self.report({'ERROR'}, "Select a Lightning Asset object")
+            return {'CANCELLED'}
 
-        # Remove previously generated lightning objects
-        to_remove = [o for o in context.scene.objects if o.name.startswith("Lightning")]
-        for o in to_remove:
-            bpy.data.objects.remove(o, do_unlink=True)
+        props = asset_obj.lightning_props
+        props.seed += 1
 
         obj, msg = run_generation(context, props)
         if obj is None:
@@ -302,9 +396,30 @@ class LIGHTNING_OT_regenerate(Operator):
             return {'CANCELLED'}
 
         bpy.ops.object.select_all(action='DESELECT')
+        asset_obj.select_set(True)
         obj.select_set(True)
-        context.view_layer.objects.active = obj
+        context.view_layer.objects.active = asset_obj
         self.report({'INFO'}, f"Seed {props.seed} → {msg}")
+        return {'FINISHED'}
+
+
+class LIGHTNING_OT_create_asset(Operator):
+    bl_idname = "mesh.lightning_create_asset"
+    bl_label = "Create Lightning Asset"
+    bl_description = "Create an Empty object that stores lightning settings"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        asset = bpy.data.objects.new("LightningAsset", None)
+        context.collection.objects.link(asset)
+        asset.empty_display_type = 'PLAIN_AXES'
+        asset.empty_display_size = 0.3
+
+        bpy.ops.object.select_all(action='DESELECT')
+        asset.select_set(True)
+        context.view_layer.objects.active = asset
+
+        self.report({'INFO'}, "Created Lightning Asset")
         return {'FINISHED'}
 
 
@@ -319,13 +434,23 @@ class LIGHTNING_PT_panel(Panel):
 
     def draw(self, context):
         layout = self.layout
-        props = context.scene.lightning_props
+        asset_obj = context.object
+
+        row = layout.row(align=True)
+        row.operator("mesh.lightning_create_asset", icon='EMPTY_AXIS', text="New Asset")
+
+        if not asset_obj:
+            layout.label(text="Select a Lightning Asset object", icon='INFO')
+            return
+
+        props = asset_obj.lightning_props
+        layout.label(text=f"Asset: {asset_obj.name}", icon='OBJECT_DATA')
 
         # Points
         box = layout.box()
         box.label(text="Points", icon='EMPTY_AXIS')
-        box.prop_search(props, "start_obj", context.scene, "objects", text="Start")
-        box.prop_search(props, "end_obj", context.scene, "objects", text="End")
+        box.prop(props, "start_obj", text="Start")
+        box.prop(props, "end_obj", text="End")
 
         # Main bolt
         box = layout.box()
@@ -369,20 +494,22 @@ class LIGHTNING_PT_panel(Panel):
         col = layout.column()
         col.scale_y = 0.75
         col.label(text="Vertex attr: 'LightningTime'", icon='INFO')
-        col.label(text="  0.05 = bolt start (top)")
+        col.label(text="  0.00 = bolt start (top)")
         col.label(text="  1.00 = bolt end (tip)")
 
 
 # ─── Properties ─────────────────────────────────────────────────────────────────
 
 class LightningProperties(PropertyGroup):
-    start_obj: StringProperty(
-        name="Start Object",
-        description="Object at the top of the lightning bolt"
+    start_obj: PointerProperty(
+        name="Start",
+        description="Object at the top of the lightning bolt",
+        type=bpy.types.Object
     )
-    end_obj: StringProperty(
-        name="End Object",
-        description="Object at the bottom / tip of the lightning bolt"
+    end_obj: PointerProperty(
+        name="End",
+        description="Object at the bottom / tip of the lightning bolt",
+        type=bpy.types.Object
     )
     main_iterations: IntProperty(
         name="Iterations",
@@ -442,6 +569,11 @@ class LightningProperties(PropertyGroup):
         description="Random seed — change for different bolt shapes",
         default=42, min=0, max=99999
     )
+    generated_obj_name: StringProperty(
+        name="Generated Object",
+        description="Internal: output object created by this asset",
+        default=""
+    )
 
 
 # ─── Menu Entry ─────────────────────────────────────────────────────────────────
@@ -456,6 +588,7 @@ classes = [
     LightningProperties,
     LIGHTNING_OT_generate,
     LIGHTNING_OT_regenerate,
+    LIGHTNING_OT_create_asset,
     LIGHTNING_PT_panel,
 ]
 
@@ -463,13 +596,13 @@ classes = [
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
-    bpy.types.Scene.lightning_props = PointerProperty(type=LightningProperties)
+    bpy.types.Object.lightning_props = PointerProperty(type=LightningProperties)
     bpy.types.VIEW3D_MT_mesh_add.append(menu_func)
 
 
 def unregister():
     bpy.types.VIEW3D_MT_mesh_add.remove(menu_func)
-    del bpy.types.Scene.lightning_props
+    del bpy.types.Object.lightning_props
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
 
